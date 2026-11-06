@@ -39,6 +39,11 @@ class FyersAuthConfig(BaseModel):
     @classmethod
     def from_env(cls) -> "FyersAuthConfig":
         """Instantiate configuration strictly from environment variables."""
+        for p in [Path("backend/.env"), Path(".env"), Path(__file__).resolve().parent.parent.parent / ".env"]:
+            if p.exists():
+                load_dotenv(p)
+                break
+
         client_id = os.getenv("FYERS_CLIENT_ID")
         secret_key = os.getenv("FYERS_SECRET_KEY")
         pin = os.getenv("FYERS_PIN")
@@ -112,7 +117,11 @@ class FyersAuthManager:
         return self.config
 
     def load_cached_token(self) -> Optional[str]:
-        """Load cached access token if file exists and token is not expired."""
+        """Load cached access token from cache file or FYERS_ACCESS_TOKEN env variable."""
+        env_token = os.getenv("FYERS_ACCESS_TOKEN")
+        if env_token and len(env_token.strip()) > 20:
+            return env_token.strip()
+
         if not self.cache_path.exists():
             return None
 
@@ -314,6 +323,46 @@ class FyersAuthManager:
         self.save_cached_token(final_token)
         return final_token
 
+    def get_login_url(self, state: str = "quant_platform") -> str:
+        """Generate the browser login URL for FYERS OAuth authorization."""
+        config = self._get_config()
+        session_model = fyersModel.SessionModel(
+            client_id=config.client_id,
+            secret_key=config.secret_key,
+            redirect_uri=config.redirect_uri,
+            response_type="code",
+            grant_type="authorization_code",
+            state=state,
+        )
+        return session_model.generate_authcode()
+
+    def exchange_auth_code(self, auth_code_or_url: str) -> str:
+        """Exchange an auth_code or full redirected URL for an access token and cache it."""
+        config = self._get_config()
+        code = auth_code_or_url.strip()
+        if "auth_code=" in code:
+            parsed = urlparse(code)
+            params = parse_qs(parsed.query)
+            if "auth_code" in params:
+                code = params["auth_code"][0]
+
+        session_model = fyersModel.SessionModel(
+            client_id=config.client_id,
+            secret_key=config.secret_key,
+            redirect_uri=config.redirect_uri,
+            response_type="code",
+            grant_type="authorization_code",
+        )
+        session_model.set_token(code)
+        token_response = session_model.generate_token()
+
+        if not isinstance(token_response, dict) or "access_token" not in token_response:
+            raise RuntimeError(f"Failed to exchange auth_code for access_token: {token_response}")
+
+        final_token = token_response["access_token"]
+        self.save_cached_token(final_token)
+        return final_token
+
     def get_client(self, force_reauth: bool = False) -> fyersModel.FyersModel:
         """Get an authenticated FyersModel client instance.
         
@@ -335,6 +384,27 @@ class FyersAuthManager:
                         is_async=False,
                     )
                 logger.info("Cached token health check failed. Re-authenticating...")
+
+        # Check if auth_code is provided in environment variables
+        env_auth_code = (
+            os.getenv("FYERS_AUTH_CODE")
+            or os.getenv("AUTH_CODE")
+            or os.getenv("FYERS_AUTHCODE")
+            or os.getenv("AUTHCODE")
+        )
+        if env_auth_code and env_auth_code.strip():
+            try:
+                logger.info("Exchanging auth code found in environment...")
+                token = self.exchange_auth_code(env_auth_code.strip())
+                profile = self.verify_token_health(config.client_id, token)
+                if profile is not None:
+                    return fyersModel.FyersModel(
+                        client_id=config.client_id,
+                        token=token,
+                        is_async=False,
+                    )
+            except Exception as e:
+                logger.warning("Failed to exchange auth code from environment: %s", e)
 
         # Authenticate headlessly
         token = self.authenticate_headless()
