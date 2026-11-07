@@ -1,5 +1,15 @@
-"""Options Volatility Modeling and Pricing Models."""
+"""Options Volatility Modeling, TFT Price Forecasting, and Pricing Models."""
 
+from backend.app.models.tft_model import (
+    CandleBufferManager,
+    HorizonForecast,
+    TFTForecastResponse,
+    TFTPriceForecaster,
+    candle_buffer_manager,
+    get_tft_model,
+    on_candle_completed,
+    predict_realtime,
+)
 from backend.app.models.volatility import (
     GreeksResult,
     OptionQuote,
@@ -28,4 +38,12 @@ __all__ = [
     "SVICalibrator",
     "calibrate_option_surface",
     "generate_synthetic_option_chain",
+    "TFTPriceForecaster",
+    "get_tft_model",
+    "predict_realtime",
+    "on_candle_completed",
+    "candle_buffer_manager",
+    "HorizonForecast",
+    "TFTForecastResponse",
 ]
+

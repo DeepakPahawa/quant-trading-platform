@@ -102,7 +102,7 @@ def broadcast_depth(depth: Dict[str, Any], metrics: MicrostructureMetrics) -> No
 
 
 def broadcast_bar(bar: Dict[str, Any]) -> None:
-    """Publish completed 1-minute OHLCV bar to WebSocket clients."""
+    """Publish completed 1-minute OHLCV bar to WebSocket clients and trigger TFT inference hook."""
     payload = {
         "type": "bar",
         "symbol": bar.get("symbol"),
@@ -110,6 +110,13 @@ def broadcast_bar(bar: Dict[str, Any]) -> None:
         "data": bar,
     }
     broadcaster.dispatch_from_thread(payload)
+
+    # Real-time TFT multi-horizon inference hook
+    try:
+        from backend.app.models.tft_model import on_candle_completed
+        on_candle_completed(bar, broadcaster_dispatch=broadcaster.dispatch_from_thread)
+    except Exception as e:
+        logger.error("Error executing real-time TFT inference hook: %s", e)
 
 
 def attach_socket_manager_to_broadcaster(socket_manager: FyersSocketManager) -> None:
