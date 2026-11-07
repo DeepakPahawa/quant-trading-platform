@@ -1,0 +1,166 @@
+:root {
+  --bg: #f8fafc;
+  --surface: #ffffff;
+  --text: #0f172a;
+  --muted: #475569;
+  --border: #e2e8f0;
+  --accent: #2563eb;
+  --up: #15803d;
+  --down: #b91c1c;
+  --notice-bg: #fef3c7;
+  --notice-text: #78350f;
+  color-scheme: light dark;
+  font-family: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  line-height: 1.5;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme='light']) {
+    --bg: #0b1120;
+    --surface: #111a2e;
+    --text: #e2e8f0;
+    --muted: #94a3b8;
+    --border: #1e293b;
+    --accent: #60a5fa;
+    --up: #4ade80;
+    --down: #f87171;
+    --notice-bg: #3b2f0b;
+    --notice-text: #fde68a;
+  }
+}
+
+:root[data-theme='dark'] {
+  --bg: #0b1120;
+  --surface: #111a2e;
+  --text: #e2e8f0;
+  --muted: #94a3b8;
+  --border: #1e293b;
+  --accent: #60a5fa;
+  --up: #4ade80;
+  --down: #f87171;
+  --notice-bg: #3b2f0b;
+  --notice-text: #fde68a;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  min-height: 100vh;
+}
+
+a { color: var(--accent); }
+
+h1 { font-size: 1.5rem; margin: 0 0 0.75rem; }
+h2 { font-size: 1.05rem; margin: 0 0 0.5rem; }
+
+.topbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 1rem;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.75rem 1rem;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+}
+.topbar .brand { font-weight: 700; color: var(--text); text-decoration: none; }
+.topbar nav { display: flex; gap: 1rem; flex-wrap: wrap; }
+.topbar nav a { color: var(--muted); text-decoration: none; }
+.topbar nav a.active { color: var(--accent); font-weight: 600; }
+
+.container {
+  padding: 1rem;
+  max-width: 1200px;
+  margin: 0 auto;
+}
+
+.page-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  margin-bottom: 0.75rem;
+}
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 1rem;
+  margin-bottom: 1rem;
+}
+
+.grid-2 {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 1rem;
+}
+@media (min-width: 900px) {
+  .grid-2 { grid-template-columns: 2fr 1fr; }
+}
+
+.chart { width: 100%; height: 380px; }
+
+.table-wrap { overflow-x: auto; background: var(--surface); border: 1px solid var(--border); border-radius: 10px; }
+table { width: 100%; border-collapse: collapse; }
+th, td { padding: 0.6rem 0.75rem; border-bottom: 1px solid var(--border); text-align: left; white-space: nowrap; }
+th[scope='row'] { font-weight: 600; }
+.num { text-align: right; font-variant-numeric: tabular-nums; }
+.up { color: var(--up); }
+.down { color: var(--down); }
+.muted { color: var(--muted); }
+.small { font-size: 0.85rem; }
+.disclaimer { font-size: 0.8rem; color: var(--muted); margin: 0.75rem 0 0; }
+
+.notice {
+  background: var(--notice-bg);
+  color: var(--notice-text);
+  border-radius: 8px;
+  padding: 0.6rem 0.8rem;
+  margin-bottom: 0.75rem;
+}
+
+button {
+  font: inherit;
+  padding: 0.45rem 0.9rem;
+  border-radius: 8px;
+  border: 1px solid var(--accent);
+  background: var(--accent);
+  color: #fff;
+  cursor: pointer;
+}
+button:disabled { opacity: 0.5; cursor: not-allowed; }
+
+textarea {
+  width: 100%;
+  font: inherit;
+  padding: 0.5rem;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text);
+  margin: 0.4rem 0 0.6rem;
+}
+
+label { font-weight: 600; font-size: 0.9rem; }
+
+.horizon + .horizon { margin-top: 1rem; border-top: 1px solid var(--border); padding-top: 1rem; }
+.horizon-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem; }
+.bias { font-size: 0.9rem; font-weight: 600; }
+.bias-bullish { color: var(--up); }
+.bias-bearish { color: var(--down); }
+.bias-neutral { color: var(--muted); }
+
+/* Band: the shaded range is p10..p90. The marker is p50. Text labels carry the meaning too. */
+.band { position: relative; height: 14px; border-radius: 7px; background: var(--border); margin: 0.25rem 0; }
+.band-range { position: absolute; inset: 0; border-radius: 7px; background: color-mix(in srgb, var(--accent) 35%, transparent); }
+.band-median { position: absolute; top: -4px; bottom: -4px; width: 3px; margin-left: -1.5px; background: var(--accent); border-radius: 2px; }
+.band-labels { display: flex; justify-content: space-between; gap: 0.5rem; font-size: 0.8rem; color: var(--muted); flex-wrap: wrap; }
+
+.sr-only {
+  position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+  overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
+}

@@ -32,6 +32,15 @@ ENV/
 *.parquet
 *.duckdb
 
+# Local runtime data: DuckDB, Parquet archive, trained model checkpoints and sidecars
+backend/data/
+*.ckpt
+*.pt
+
+# Frontend build output and dependencies
+frontend/node_modules/
+frontend/dist/
+
 # Logs
 *.log
 
