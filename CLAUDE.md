@@ -87,6 +87,13 @@ pnpm typecheck && pnpm test && pnpm lint && pnpm build   # agent verification
 - Backtest: `backend/app/backtest/swing_backtest.py`. Equal-weight top-N, rebalanced every H days, delivery costs.
 - Scripts: `backfill_bars --universe nifty50 --resolution D`, `run_swing_research` (walk-forward report), `swing_suggest` (latest-day ranking).
 
+## Rule-based strategies (daily, data-agnostic)
+
+- Strategies: `backend/app/strategies/` (`rsi2_pullback`, `breakout_momentum`, `rs_pullback`). Each is a frozen dataclass of parameters with `prepare(bars, bench)` returning entry/exit signals at the close. No portfolio, cost, or data-source code inside a strategy.
+- Engine: `backend/app/backtest/strategy_engine.py`. Signals fill at the next open. ATR stops are intraday (gap-through fills at the open). Equal slots, priority ordering, slippage (default 5 bps/side), `DeliveryCostModel` costs.
+- Run on any universe: `python -m backend.scripts.run_strategy --strategy all --universe nifty500` (`--universe NAME` reads `backend/data/universe/NAME.csv`; backfill its daily bars first). Override parameters with `--param key=value`. Add a strategy by subclassing `Strategy` and registering it in `strategies/__init__.py`.
+- Choices that were not in the original rule text: `rs_pullback` uses RSI(3)<30 above the 50d SMA, exits on RSI(3)>60 or momentum rank below the top 40%, with a 3×ATR stop and a 15-bar time stop. `breakout_momentum` volume confirmation is 1.5× the prior 20-day average and relative strength is a 20-day return above Nifty's. `rsi2_pullback` has no stop or time stop by default.
+
 Evidence to keep in mind: on 10 null synthetic universes (pure random walks), the top-3 strategy's excess return averaged +7.7% with a standard deviation of 21.8%. Small samples produce large swings. Trust a result only with 100+ trades.
 
 ## Model contract (TFT)
