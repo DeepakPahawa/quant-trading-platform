@@ -1,21 +1,24 @@
-"""Temporal Fusion Transformer (TFT) Multi-Horizon Price and Return Forecasting.
+"""Temporal Fusion Transformer (TFT) multi-horizon price forecasting.
 
-Implements:
-1. TFTPriceForecaster: PyTorch Forecasting Temporal Fusion Transformer configured for:
-   - Input shape: [batch_size, 60_bars, n_features]
-   - Multivariate continuous inputs:
-     [log_return, volume_ratio, rsi_14, vwap_diff, depth_imbalance, micro_price_spread]
-   - Time covariates: normalized minute-of-day (0 to 375) and day-of-week
-   - Quantile predictions (p10, p50, p90) for horizons t+5m and t+15m
-2. predict_realtime(feature_buffer): Real-time inference hook in torch.no_grad() mode:
-   - Returns {"status": "BUFFERING"} if buffer has < 60 bars.
-   - Computes multi-horizon quantile price forecasts and directional bias.
-3. CandleBufferManager & on_candle_completed: Real-time hook for market WebSocket broadcast.
+Contract
+--------
+- Input: 60 one-minute bars, 8 columns in `ALL_FEATURES` order
+  (6 continuous features followed by `minute_of_day` and `day_of_week`, taken
+  from real IST session time).
+- Output: quantile log-returns of shape [batch, 15, 3] for steps t+1 .. t+15
+  bars, quantiles (p10, p50, p90). Step k is the return from the last observed
+  bar to bar t+k. Index 4 is t+5m and index 14 is t+15m.
+- Normalization (per-feature mean/std and the target scale) is stored as buffers,
+  so it is part of the saved state_dict and inference matches training exactly.
+
+Training lives in `backend/app/models/tft_training.py`. This module is inference only.
 """
 
 from collections import defaultdict
-from datetime import datetime, timezone
+import json
 import logging
+import os
+from pathlib import Path
 import threading
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
@@ -35,25 +38,24 @@ with warnings.catch_warnings():
     from pytorch_forecasting.metrics import QuantileLoss
 
 from backend.app.data.market_overview import prepare_tft_feature_tensor
+from backend.app.features.tft_features import (
+    ALL_FEATURES,
+    CONTINUOUS_FEATURES,
+    SESSION_LENGTH_MINUTES,
+    TIME_COVARIATES,
+)
 
 logger = logging.getLogger(__name__)
 
-# TFT Skill Specifications
+# TFT architecture constants
 SEQUENCE_LENGTH = 60
 PREDICTION_HORIZONS = [5, 15]
 MAX_PREDICTION_LENGTH = 15
 QUANTILES = [0.1, 0.5, 0.9]
 
-CONTINUOUS_FEATURES = [
-    "log_return",
-    "volume_ratio",
-    "rsi_14",
-    "vwap_diff",
-    "depth_imbalance",
-    "micro_price_spread",
-]
-TIME_COVARIATES = ["minute_of_day", "day_of_week"]
-ALL_FEATURES = CONTINUOUS_FEATURES + TIME_COVARIATES
+MODEL_FILENAME = "model.pt"
+SIDECAR_FILENAME = "sidecar.json"
+MODEL_DIR_ENV = "TFT_MODEL_DIR"
 
 
 class HorizonForecast(BaseModel):
@@ -83,7 +85,7 @@ class TFTForecastResponse(BaseModel):
 
 
 class TFTPriceForecaster(nn.Module):
-    """Temporal Fusion Transformer configured for 60-bar multivariate price return forecasting."""
+    """Temporal Fusion Transformer for 60-bar multivariate quantile return forecasting."""
 
     def __init__(
         self,
@@ -99,19 +101,13 @@ class TFTPriceForecaster(nn.Module):
         self.prediction_length = prediction_length
         self.quantiles = QUANTILES
 
-        # Initialize underlying PyTorch Forecasting TemporalFusionTransformer
+        # The dataset only defines the variable layout the TFT is built from.
+        # Its values are never used for training or inference.
         total_len = sequence_length + prediction_length
         dummy_df = pd.DataFrame({
             "time_idx": list(range(total_len)),
             "group": ["0"] * total_len,
-            "log_return": [0.0] * total_len,
-            "volume_ratio": [1.0] * total_len,
-            "rsi_14": [50.0] * total_len,
-            "vwap_diff": [0.0] * total_len,
-            "depth_imbalance": [0.0] * total_len,
-            "micro_price_spread": [0.0] * total_len,
-            "minute_of_day": [float(i % 375) for i in range(total_len)],
-            "day_of_week": [1.0] * total_len,
+            **{name: [0.0] * total_len for name in ALL_FEATURES},
             "target": [0.0] * total_len,
         })
 
@@ -140,37 +136,91 @@ class TFTPriceForecaster(nn.Module):
                 loss=QuantileLoss(self.quantiles),
             )
 
-    def _prepare_input_dict(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """Convert a [batch_size, seq_len, n_features] tensor into the dictionary expected by TFT."""
-        batch_size, seq_len, n_features = x.shape
-        device = x.device
+        # pytorch-forecasting orders reals as known-first (time covariates), then unknown.
+        # Map our canonical ALL_FEATURES order onto that layout by name, never by position.
+        x_reals: List[str] = list(self.tft.hparams.x_reals)
+        known_reals: List[str] = list(self.tft.hparams.time_varying_reals_decoder)
+        if set(known_reals) != set(TIME_COVARIATES):
+            raise RuntimeError(f"Unexpected known reals {known_reals}; expected {TIME_COVARIATES}")
+        self._encoder_perm = torch.tensor([ALL_FEATURES.index(n) for n in x_reals], dtype=torch.long)
+        self._minute_idx = ALL_FEATURES.index("minute_of_day")
+        self._dow_idx = ALL_FEATURES.index("day_of_week")
 
-        if n_features == 6:
-            # Append synthesized normalized time covariates: minute_of_day (0-375) and day_of_week
-            minute_cov = torch.linspace(0, 375, seq_len, device=device).unsqueeze(0).repeat(batch_size, 1).unsqueeze(-1)
-            dow_cov = torch.ones(batch_size, seq_len, 1, device=device)
-            encoder_cont = torch.cat([x, minute_cov, dow_cov], dim=-1)
-        elif n_features == 8:
-            encoder_cont = x
-        elif n_features < 8:
-            pad = torch.zeros(batch_size, seq_len, 8 - n_features, device=device)
-            encoder_cont = torch.cat([x, pad], dim=-1)
-        else:
-            encoder_cont = x[:, :, :8]
+        # Normalization state. Defaults are identity, so an untrained model is well-defined.
+        self.register_buffer("input_mean", torch.zeros(len(ALL_FEATURES)))
+        self.register_buffer("input_std", torch.ones(len(ALL_FEATURES)))
+        self.register_buffer("target_scale", torch.tensor(1.0))
 
+    # ------------------------------------------------------------------ inputs
+
+    def _assemble(
+        self,
+        x: torch.Tensor,
+        time_covariates: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Return [B, L, 8] raw features in ALL_FEATURES order."""
+        if x.ndim == 2:
+            x = x.unsqueeze(0)
+        if x.shape[-1] == len(ALL_FEATURES):
+            return x.float()
+        if x.shape[-1] == len(CONTINUOUS_FEATURES):
+            if time_covariates is None:
+                raise ValueError(
+                    "Time covariates (minute_of_day, day_of_week) are required with 6-feature input. "
+                    "Pass real IST time covariates; they are not synthesized."
+                )
+            if time_covariates.ndim == 2:
+                time_covariates = time_covariates.unsqueeze(0)
+            if time_covariates.shape[:2] != x.shape[:2] or time_covariates.shape[-1] != len(TIME_COVARIATES):
+                raise ValueError(
+                    f"time_covariates must have shape [B, L, {len(TIME_COVARIATES)}] matching x; "
+                    f"got {tuple(time_covariates.shape)} for x {tuple(x.shape)}"
+                )
+            return torch.cat([x.float(), time_covariates.float()], dim=-1)
+        raise ValueError(
+            f"Expected last dimension {len(CONTINUOUS_FEATURES)} or {len(ALL_FEATURES)}, got {x.shape[-1]}"
+        )
+
+    def _future_time_covariates(self, x_raw: torch.Tensor) -> torch.Tensor:
+        """Known future time covariates for the decoder, in raw units.
+
+        Bars are one minute apart, so minute_of_day advances by one per step, clamped
+        to the session length. day_of_week stays at the last observed value.
+        """
+        batch_size = x_raw.shape[0]
+        device = x_raw.device
+        last_minute = x_raw[:, -1, self._minute_idx]  # [B]
+        steps = torch.arange(1, self.prediction_length + 1, device=device, dtype=x_raw.dtype)  # [P]
+        future_minute = torch.clamp(last_minute.unsqueeze(1) + steps.unsqueeze(0), 0.0, float(SESSION_LENGTH_MINUTES))
+        future_dow = x_raw[:, -1, self._dow_idx].unsqueeze(1).expand(batch_size, self.prediction_length)
+        future = torch.zeros(batch_size, self.prediction_length, len(ALL_FEATURES), device=device, dtype=x_raw.dtype)
+        future[:, :, self._minute_idx] = future_minute
+        future[:, :, self._dow_idx] = future_dow
+        return future
+
+    def _prepare_input_dict(self, x_raw: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """Build the TFT input dict from raw [B, L, 8] features (normalizes internally)."""
+        batch_size, seq_len, _ = x_raw.shape
+        device = x_raw.device
         pred_len = self.prediction_length
-        decoder_cont = torch.zeros(batch_size, pred_len, 8, device=device)
 
-        # Propagate forward time covariates into decoder steps
-        last_min = encoder_cont[:, -1:, 6:7]
-        future_mins = ((last_min + torch.arange(1, pred_len + 1, device=device).unsqueeze(0).unsqueeze(-1)) % 375.0)
-        decoder_cont[:, :, 6:7] = future_mins
-        decoder_cont[:, :, 7:8] = encoder_cont[:, -1:, 7:8].repeat(1, pred_len, 1)
+        mean = self.input_mean.to(device)
+        std = self.input_std.to(device)
+
+        x_norm = (x_raw - mean) / std
+        # pytorch-forecasting concatenates encoder and decoder along time, so both must carry
+        # every real in x_reals order. Only the known (time) features are real in the decoder.
+        # Unknown continuous features are unobserved in the future and are set to zero.
+        future_norm = (self._future_time_covariates(x_raw) - mean) / std
+        future_norm[:, :, : len(CONTINUOUS_FEATURES)] = 0.0
+
+        encoder_cont = x_norm[:, :, self._encoder_perm]
+        decoder_cont = future_norm[:, :, self._encoder_perm]
 
         return {
             "encoder_cat": torch.zeros(batch_size, seq_len, 0, dtype=torch.int64, device=device),
             "encoder_cont": encoder_cont.float(),
-            "encoder_target": encoder_cont[:, :, 0].float(),
+            "encoder_target": x_norm[:, :, ALL_FEATURES.index("log_return")].float(),
             "encoder_lengths": torch.full((batch_size,), seq_len, dtype=torch.int64, device=device),
             "decoder_cat": torch.zeros(batch_size, pred_len, 0, dtype=torch.int64, device=device),
             "decoder_cont": decoder_cont.float(),
@@ -181,39 +231,88 @@ class TFTPriceForecaster(nn.Module):
             "target_scale": torch.tensor([[0.0, 1.0]], device=device).repeat(batch_size, 1),
         }
 
-    def forward(self, x: Union[torch.Tensor, Dict[str, torch.Tensor]]) -> torch.Tensor:
-        """Forward inference pass.
-        
-        Args:
-            x: Input tensor [batch_size, 60, n_features] or raw TFT input dict.
-            
-        Returns:
-            Quantile prediction tensor [batch_size, 15, 3] sorted such that
-            p10 <= p50 <= p90 across all horizons.
-        """
-        if isinstance(x, torch.Tensor):
-            x_dict = self._prepare_input_dict(x)
-        else:
-            x_dict = x
+    # ----------------------------------------------------------------- forward
 
-        raw_pred = self.tft(x_dict).prediction
-        # Quantile sorting guarantees strictly non-crossing quantiles: p10 <= p50 <= p90
-        sorted_pred, _ = torch.sort(raw_pred, dim=-1)
-        return sorted_pred
+    def forward(
+        self,
+        x: Union[torch.Tensor, Dict[str, torch.Tensor]],
+        time_covariates: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Quantile log-return forecasts in raw return units.
+
+        Args:
+            x: [B, 60, 8] features in ALL_FEATURES order, or [B, 60, 6] continuous
+               features together with `time_covariates` [B, 60, 2].
+            time_covariates: Real minute_of_day and day_of_week, used with 6-feature input.
+
+        Returns:
+            Tensor [B, 15, 3] of (p10, p50, p90) log-returns, sorted so p10 <= p50 <= p90.
+        """
+        if isinstance(x, dict):
+            raw_pred = self.tft(x).prediction
+            return torch.sort(raw_pred, dim=-1).values
+
+        x_raw = self._assemble(x, time_covariates)
+        raw_pred = self.tft(self._prepare_input_dict(x_raw)).prediction  # normalized target units
+        pred = torch.sort(raw_pred, dim=-1).values
+        return pred * self.target_scale.to(pred.device)
 
     def predict_horizons(
         self,
         x: torch.Tensor,
         horizons: List[int] = PREDICTION_HORIZONS,
+        time_covariates: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
-        """Extract multi-horizon quantile predictions for specified forward steps (e.g., t+5m, t+15m)."""
-        pred = self.forward(x)  # [batch_size, 15, 3]
-        results = {}
+        """Extract quantile forecasts at horizons t+h minutes (h is 1-based bar count)."""
+        pred = self.forward(x, time_covariates=time_covariates)  # [B, 15, 3]
+        results: Dict[str, torch.Tensor] = {}
         for h in horizons:
-            # 1-based horizon step to 0-based index
             idx = min(max(h - 1, 0), self.prediction_length - 1)
             results[f"t+{h}m"] = pred[:, idx, :]
         return results
+
+    # ------------------------------------------------------------- persistence
+
+    def set_normalization(self, mean: np.ndarray, std: np.ndarray, target_scale: float) -> None:
+        """Set input normalization (per ALL_FEATURES column) and the target scale."""
+        self.input_mean.copy_(torch.as_tensor(mean, dtype=torch.float32))
+        self.input_std.copy_(torch.as_tensor(np.where(std > 0, std, 1.0), dtype=torch.float32))
+        self.target_scale.fill_(float(target_scale) if target_scale > 0 else 1.0)
+
+    def save_run(self, run_dir: Union[str, Path], sidecar: Dict[str, Any]) -> None:
+        """Write model weights and a JSON sidecar describing the run."""
+        run_path = Path(run_dir)
+        run_path.mkdir(parents=True, exist_ok=True)
+        torch.save(self.state_dict(), run_path / MODEL_FILENAME)
+        payload = {
+            **sidecar,
+            "features": ALL_FEATURES,
+            "sequence_length": self.sequence_length,
+            "prediction_length": self.prediction_length,
+            "quantiles": self.quantiles,
+            "horizons": PREDICTION_HORIZONS,
+        }
+        (run_path / SIDECAR_FILENAME).write_text(json.dumps(payload, indent=2, default=str))
+
+    @classmethod
+    def load_run(cls, run_dir: Union[str, Path]) -> "TFTPriceForecaster":
+        """Load a run written by `save_run`. Refuses to load if the feature schema differs."""
+        run_path = Path(run_dir)
+        sidecar = json.loads((run_path / SIDECAR_FILENAME).read_text())
+        if sidecar.get("features") != ALL_FEATURES:
+            raise ValueError(
+                f"Checkpoint feature schema {sidecar.get('features')} does not match {ALL_FEATURES}"
+            )
+        if sidecar.get("sequence_length") != SEQUENCE_LENGTH:
+            raise ValueError(f"Checkpoint sequence_length {sidecar.get('sequence_length')} != {SEQUENCE_LENGTH}")
+        if sidecar.get("prediction_length") != MAX_PREDICTION_LENGTH:
+            raise ValueError("Checkpoint prediction_length does not match the running code")
+
+        model = cls()
+        state = torch.load(run_path / MODEL_FILENAME, map_location="cpu", weights_only=True)
+        model.load_state_dict(state)
+        model.eval()
+        return model
 
 
 # Module-level model singleton
@@ -222,14 +321,23 @@ _model_lock = threading.Lock()
 
 
 def get_tft_model() -> TFTPriceForecaster:
-    """Retrieve or initialize the global singleton TFT model in eval mode."""
+    """Return the singleton model in eval mode.
+
+    Loads the trained run at $TFT_MODEL_DIR when set. Otherwise falls back to untrained
+    weights and logs a warning, so forecasts from an untrained model are never silent.
+    """
     global _global_tft_model
     if _global_tft_model is None:
         with _model_lock:
             if _global_tft_model is None:
-                logger.info("Initializing Temporal Fusion Transformer model...")
-                model = TFTPriceForecaster()
-                model.eval()
+                run_dir = os.getenv(MODEL_DIR_ENV)
+                if run_dir:
+                    logger.info("Loading trained TFT run from %s", run_dir)
+                    model = TFTPriceForecaster.load_run(run_dir)
+                else:
+                    logger.warning("%s not set: serving UNTRAINED TFT weights", MODEL_DIR_ENV)
+                    model = TFTPriceForecaster()
+                    model.eval()
                 _global_tft_model = model
     return _global_tft_model
 
@@ -237,10 +345,10 @@ def get_tft_model() -> TFTPriceForecaster:
 def prepare_buffer_tensor(
     buffer: Union[pl.DataFrame, List[Dict[str, Any]], torch.Tensor],
 ) -> Tuple[Optional[torch.Tensor], Optional[float], Optional[int]]:
-    """Convert input buffer into a [1, 60, n_features] PyTorch tensor and extract latest price/timestamp.
-    
+    """Convert a bar buffer into a [1, 60, 8] tensor, plus the latest close and timestamp.
+
     Returns:
-        (tensor, current_price, latest_timestamp) or (None, None, None) if buffer < 60 bars.
+        (tensor, current_price, latest_timestamp), or (None, None, None) if fewer than 60 bars.
     """
     if isinstance(buffer, torch.Tensor):
         t = buffer
@@ -250,7 +358,6 @@ def prepare_buffer_tensor(
             return None, None, None
         return t[:, -SEQUENCE_LENGTH:, :], None, None
 
-    # Handle DataFrame or list of bar dicts
     if isinstance(buffer, list):
         if len(buffer) < SEQUENCE_LENGTH:
             return None, None, None
@@ -262,24 +369,11 @@ def prepare_buffer_tensor(
     else:
         return None, None, None
 
-    # Compute features via Polars feature pipeline
-    features_df = prepare_tft_feature_tensor(
-        df,
-        depth_imbalance=float(df["depth_imbalance"][-1]) if "depth_imbalance" in df.columns else 0.0,
-        micro_price_spread=float(df["micro_price_spread"][-1]) if "micro_price_spread" in df.columns else 0.0,
-        sequence_length=SEQUENCE_LENGTH,
-    )
-
+    features_df = prepare_tft_feature_tensor(df, sequence_length=SEQUENCE_LENGTH)
     if len(features_df) < SEQUENCE_LENGTH:
         return None, None, None
 
-    cols = ALL_FEATURES
-    # Verify required feature columns exist
-    for c in cols:
-        if c not in features_df.columns:
-            features_df = features_df.with_columns(pl.lit(0.0).alias(c))
-
-    np_mat = features_df.select(cols).fill_nan(0.0).fill_null(0.0).to_numpy()
+    np_mat = features_df.select(ALL_FEATURES).to_numpy()
     tensor = torch.tensor(np_mat, dtype=torch.float32).unsqueeze(0)
 
     current_price = float(df["close"][-1]) if "close" in df.columns else None
@@ -293,30 +387,10 @@ def predict_realtime(
     current_price: Optional[float] = None,
     symbol: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Execute real-time TFT inference in torch.no_grad() mode.
-    
-    Args:
-        feature_buffer: List of candle dicts, Polars DataFrame, or raw feature tensor.
-        current_price: Reference price to convert forecasted log returns into price levels.
-        symbol: Trading symbol identifier.
-        
-    Returns:
-        If buffer has < 60 bars:
-            {"status": "BUFFERING"}
-        If buffer has >= 60 bars:
-            {
-                "status": "READY",
-                "timestamp": int,
-                "current_price": float,
-                "p10": float,
-                "p50": float,
-                "p90": float,
-                "directional_bias": "BULLISH" | "BEARISH" | "NEUTRAL",
-                "horizons": {
-                    "t+5m": {...},
-                    "t+15m": {...}
-                }
-            }
+    """Run TFT inference under torch.no_grad().
+
+    Returns {"status": "BUFFERING"} when fewer than 60 bars are available. Otherwise
+    returns a READY payload with per-horizon price quantiles.
     """
     tensor, inferred_price, inferred_ts = prepare_buffer_tensor(feature_buffer)
     if tensor is None or tensor.shape[1] < SEQUENCE_LENGTH:
@@ -329,17 +403,15 @@ def predict_realtime(
     model.eval()
 
     with torch.no_grad():
-        preds = model(tensor)  # Shape [1, 15, 3]
+        preds = model(tensor)  # [1, 15, 3] log-returns
 
-    # Step 5: index 4; Step 15: index 14
     step_5_ret = preds[0, 4, :].cpu().numpy()
     step_15_ret = preds[0, 14, :].cpu().numpy()
 
-    # Enforce strict quantile monotonicity
     p10_r5, p50_r5, p90_r5 = float(step_5_ret[0]), float(step_5_ret[1]), float(step_5_ret[2])
     p10_r15, p50_r15, p90_r15 = float(step_15_ret[0]), float(step_15_ret[1]), float(step_15_ret[2])
 
-    # Convert log-returns to forecasted price levels: P_forecast = P_current * exp(r)
+    # P_forecast = P_current * exp(r)
     p10_p5 = ref_price * np.exp(p10_r5)
     p50_p5 = ref_price * np.exp(p50_r5)
     p90_p5 = ref_price * np.exp(p90_r5)
@@ -348,7 +420,6 @@ def predict_realtime(
     p50_p15 = ref_price * np.exp(p50_r15)
     p90_p15 = ref_price * np.exp(p90_r15)
 
-    # Determine directional bias from median expected return
     def derive_bias(med_ret: float) -> str:
         if med_ret > 0.0001:
             return "BULLISH"
@@ -406,7 +477,6 @@ class CandleBufferManager:
         """Append a bar to the symbol's buffer and prune to max_buffer_size."""
         with self._lock:
             buf = self._buffers[symbol]
-            # Avoid duplicate bar timestamps
             if not buf or buf[-1].get("timestamp") != bar.get("timestamp"):
                 buf.append(dict(bar))
                 if len(buf) > self.max_buffer_size:
@@ -435,10 +505,9 @@ def on_candle_completed(
     bar: Dict[str, Any],
     broadcaster_dispatch: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> Dict[str, Any]:
-    """Real-time inference hook executed on every completed 1-minute candle.
-    
-    Updates the rolling buffer, runs predict_realtime in torch.no_grad() mode,
-    and broadcasts the result over the market WebSocket.
+    """Real-time inference hook run on every completed 1-minute candle.
+
+    Updates the rolling buffer, runs predict_realtime, and broadcasts the result.
     """
     symbol = bar.get("symbol", "UNKNOWN")
     buffer = candle_buffer_manager.append_bar(symbol, bar)
@@ -471,7 +540,6 @@ def on_candle_completed(
             "horizons": forecast.get("horizons"),
         }
 
-    # Dispatch to WebSocket clients if broadcaster callback provided
     if broadcaster_dispatch is not None:
         broadcaster_dispatch(payload)
     else:
@@ -482,4 +550,3 @@ def on_candle_completed(
             logger.debug("Broadcaster not available for TFT dispatch: %s", e)
 
     return payload
-

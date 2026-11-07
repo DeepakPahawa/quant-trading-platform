@@ -20,6 +20,7 @@ import polars as pl
 from pydantic import BaseModel, Field
 
 from backend.app.features.microstructure import calculate_microstructure_metrics
+from backend.app.features.tft_features import build_tft_feature_frame
 
 logger = logging.getLogger(__name__)
 
@@ -272,53 +273,17 @@ def prepare_tft_feature_tensor(
     if len(bars_df) < sequence_length:
         logger.warning("Fewer than %d bars available (%d). Cannot feed complete sequence.", sequence_length, len(bars_df))
 
-    # 1. Log return: ln(close / close_{t-1})
-    df = bars_df.with_columns(
-        (pl.col("close") / pl.col("close").shift(1)).log().fill_null(0.0).alias("log_return")
+    # Single shared pipeline (also used by training), so features cannot drift.
+    # Time covariates are IST session time; RSI is Wilder's (indicators.compute_rsi).
+    df = build_tft_feature_frame(
+        bars_df,
+        depth_imbalance=depth_imbalance,
+        micro_price_spread=micro_price_spread,
     )
 
-    # 2. Volume Ratio: volume / rolling_mean(volume, 20)
-    df = df.with_columns(
-        (pl.col("volume") / pl.col("volume").rolling_mean(window_size=20).fill_null(1.0))
-        .fill_nan(1.0)
-        .alias("volume_ratio")
-    )
-
-    # 3. RSI 14
-    change = pl.col("close") - pl.col("close").shift(1)
-    gain = pl.when(change > 0).then(change).otherwise(0.0)
-    loss = pl.when(change < 0).then(-change).otherwise(0.0)
-
-    avg_gain = gain.rolling_mean(window_size=14).fill_null(0.0)
-    avg_loss = loss.rolling_mean(window_size=14).fill_null(0.0)
-    rs = pl.when(avg_loss == 0).then(100.0).otherwise(avg_gain / (avg_loss + 1e-9))
-    rsi_14 = (100.0 - (100.0 / (1.0 + rs))).fill_null(50.0).alias("rsi_14")
-    df = df.with_columns(rsi_14)
-
-    # 4. VWAP diff: (close - cumulative_vwap) / cumulative_vwap
-    pv = pl.col("close") * pl.col("volume")
-    cum_pv = pv.cum_sum()
-    cum_vol = pl.col("volume").cum_sum()
-    vwap = pl.when(cum_vol > 0).then(cum_pv / cum_vol).otherwise(pl.col("close"))
-    vwap_diff = ((pl.col("close") - vwap) / vwap).fill_null(0.0).alias("vwap_diff")
-    df = df.with_columns(vwap_diff)
-
-    # 5. Microstructure covariates: depth_imbalance & micro_price_spread
-    df = df.with_columns([
-        pl.lit(depth_imbalance).alias("depth_imbalance"),
-        pl.lit(micro_price_spread).alias("micro_price_spread"),
-    ])
-
-    # 6. Time Covariates: Minute of day (0 to 375 for 09:15 to 15:30 IST) & Day of week
-    df = df.with_columns(
-        pl.from_epoch(pl.col("timestamp"), time_unit="s").alias("dt")
-    ).with_columns([
-        # Normalized minute of trading session (0 to 375)
-        ((pl.col("dt").dt.hour().cast(pl.Int32) - 9) * 60 + (pl.col("dt").dt.minute().cast(pl.Int32) - 15))
-        .clip(0, 375)
-        .alias("minute_of_day"),
-        pl.col("dt").dt.weekday().cast(pl.Int32).alias("day_of_week"),
-    ])
+    # Only the first bar has no prior close. Fill neutral values for live inference.
+    neutral_fill = {"log_return": 0.0, "volume_ratio": 1.0, "rsi_14": 50.0, "vwap_diff": 0.0}
+    df = df.with_columns([pl.col(c).fill_null(v) for c, v in neutral_fill.items()])
 
     # Select the last sequence_length (60) bars
     features = df.tail(sequence_length)

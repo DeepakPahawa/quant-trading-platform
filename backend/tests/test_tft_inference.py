@@ -36,6 +36,31 @@ from backend.app.models.tft_model import (
 )
 
 
+def real_time_covariates(batch_size: int, seq_len: int) -> torch.Tensor:
+    """Ascending IST minute_of_day in [0, 375] and a fixed day_of_week, shaped [B, L, 2]."""
+    minutes = torch.linspace(0.0, 375.0, seq_len).unsqueeze(0).repeat(batch_size, 1)
+    dow = torch.full((batch_size, seq_len), 2.0)
+    return torch.stack([minutes, dow], dim=-1)
+
+
+def test_minute_of_day_lands_in_its_own_slot(shared_model: TFTPriceForecaster):
+    """Regression: reals are ordered known-first by pytorch-forecasting. Columns must map by name."""
+    x_reals = list(shared_model.tft.hparams.x_reals)
+    assert x_reals[:2] == ["minute_of_day", "day_of_week"]
+    perm = shared_model._encoder_perm
+    # encoder column j must come from ALL_FEATURES[perm[j]] whose name is x_reals[j]
+    from backend.app.features.tft_features import ALL_FEATURES
+    for j, name in enumerate(x_reals):
+        assert ALL_FEATURES[int(perm[j])] == name
+
+
+def test_six_feature_input_without_time_is_rejected(shared_model: TFTPriceForecaster):
+    """Time covariates must be real. Synthesized values are not allowed."""
+    x = torch.randn(1, 60, 6)
+    with pytest.raises(ValueError, match="Time covariates"):
+        shared_model(x)
+
+
 def generate_synthetic_candles(count: int, base_price: float = 2500.0) -> List[Dict[str, Any]]:
     """Helper to generate realistic 1-minute OHLCV candles."""
     now = int(time.time()) - (count * 60)
@@ -84,9 +109,10 @@ class TestTFTInference:
 
         # Continuous inputs: [log_return, volume_ratio, rsi_14, vwap_diff, depth_imbalance, micro_price_spread]
         x = torch.randn(batch_size, seq_len, n_features, dtype=torch.float32)
+        time_cov = real_time_covariates(batch_size, seq_len)
 
         with torch.no_grad():
-            out = shared_model(x)
+            out = shared_model(x, time_covariates=time_cov)
 
         # Expected shape: [batch_size, 15_horizons, 3_quantiles]
         assert out.shape == (batch_size, 15, 3), f"Expected shape (1, 15, 3), got {out.shape}"
@@ -127,7 +153,9 @@ class TestTFTInference:
         x = torch.randn(1, 60, 6, dtype=torch.float32)
 
         with torch.no_grad():
-            horizons = shared_model.predict_horizons(x, horizons=[5, 15])
+            horizons = shared_model.predict_horizons(
+                x, horizons=[5, 15], time_covariates=real_time_covariates(1, 60)
+            )
 
         assert "t+5m" in horizons
         assert "t+15m" in horizons

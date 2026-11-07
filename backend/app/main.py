@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 
 from backend.app.auth.fyers_auth import get_valid_fyers_client
 from backend.app.routers.backtest import router as backtest_router
+from backend.app.routers.forecast import router as forecast_router
 from backend.app.routers.market import router as market_router
 from backend.app.routers.options import router as options_router
 from backend.app.routers.stream import router as stream_router
@@ -44,6 +45,7 @@ app.include_router(market_router)
 app.include_router(options_router)
 app.include_router(stream_router)
 app.include_router(backtest_router)
+app.include_router(forecast_router)
 
 
 class HealthResponse(BaseModel):

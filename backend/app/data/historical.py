@@ -145,13 +145,24 @@ def parse_candles_to_polars(candles: Optional[List[List[Any]]]) -> pl.DataFrame:
     return df.unique(subset=["timestamp"], keep="last").sort("timestamp")
 
 
+def is_rate_limited(message: Any) -> bool:
+    """True when a FYERS error message reports a rate limit (HTTP 429 or plan limit)."""
+    text = str(message or "").lower()
+    return "limit" in text or "429" in text
+
+
 class HistoricalBarFetcher:
     """Fetches historical OHLCV + OI data from FYERS API v3 with automatic pagination."""
 
     MAX_CHUNK_DAYS = 100
+    # FYERS Standard plan allows 5 requests/second. Pause between chunks and back off on 429s.
+    RATE_LIMIT_RETRIES = 3
+    RATE_LIMIT_BACKOFF_SEC = 1.0
 
     def __init__(self, fyers_client: Optional[fyersModel.FyersModel] = None) -> None:
         self._client = fyers_client
+        # Chunks that FYERS rejected in the most recent fetch_bars call.
+        self.failed_chunks: List[Dict[str, str]] = []
 
     @property
     def client(self) -> fyersModel.FyersModel:
@@ -183,10 +194,23 @@ class HistoricalBarFetcher:
             symbol, resolution, data["range_from"], data["range_to"]
         )
 
-        response = self.client.history(data=data)
+        response: Any = None
+        for attempt in range(self.RATE_LIMIT_RETRIES + 1):
+            response = self.client.history(data=data)
+            if (
+                isinstance(response, dict)
+                and response.get("s") == "error"
+                and is_rate_limited(response.get("message"))
+                and attempt < self.RATE_LIMIT_RETRIES
+            ):
+                wait = self.RATE_LIMIT_BACKOFF_SEC * (2 ** attempt)
+                logger.warning("FYERS rate limit hit for %s; retrying in %.1fs", symbol, wait)
+                time.sleep(wait)
+                continue
+            break
 
         if not isinstance(response, dict):
-            logger.warning("Unexpected FYERS history response: %s", response)
+            self._record_failure(symbol, resolution, range_from, range_to, f"unexpected response: {response}")
             return []
 
         status = response.get("s")
@@ -198,11 +222,30 @@ class HistoricalBarFetcher:
             return []
 
         error_msg = response.get("message") or str(response)
-        logger.warning(
-            "FYERS history returned status '%s' for %s: %s",
-            status, symbol, error_msg
-        )
+        self._record_failure(symbol, resolution, range_from, range_to, error_msg)
         return []
+
+    def _record_failure(
+        self,
+        symbol: str,
+        resolution: str,
+        range_from: date,
+        range_to: date,
+        reason: str,
+    ) -> None:
+        """Record a failed chunk so the caller can see the gap. Failures are never silent."""
+        failure = {
+            "symbol": symbol,
+            "resolution": resolution,
+            "range_from": range_from.isoformat(),
+            "range_to": range_to.isoformat(),
+            "reason": reason,
+        }
+        self.failed_chunks.append(failure)
+        logger.error(
+            "FYERS history FAILED for %s [%s to %s]: %s",
+            symbol, failure["range_from"], failure["range_to"], reason,
+        )
 
     def fetch_bars(
         self,
@@ -211,7 +254,7 @@ class HistoricalBarFetcher:
         range_from: Optional[Union[str, date, datetime, int, float]] = None,
         range_to: Optional[Union[str, date, datetime, int, float]] = None,
         cont_flag: int = 1,
-        inter_chunk_pause_sec: float = 0.05,
+        inter_chunk_pause_sec: float = 0.3,
     ) -> pl.DataFrame:
         """
         Fetch OHLCV + OI bars over an arbitrary date range with chunked 100-day pagination.
@@ -248,6 +291,7 @@ class HistoricalBarFetcher:
             norm_res, symbol, start_d, end_d, len(chunks)
         )
 
+        self.failed_chunks = []
         all_candles: List[List[Any]] = []
         for idx, (chunk_start, chunk_end) in enumerate(chunks):
             chunk_candles = self.fetch_history_chunk(
@@ -264,6 +308,11 @@ class HistoricalBarFetcher:
                 time.sleep(inter_chunk_pause_sec)
 
         df = parse_candles_to_polars(all_candles)
+        if self.failed_chunks:
+            logger.error(
+                "%d chunk(s) failed for %s; the returned bars have gaps. See fetcher.failed_chunks.",
+                len(self.failed_chunks), symbol,
+            )
         logger.info("Successfully fetched %d total bars for %s", len(df), symbol)
         return df
 
