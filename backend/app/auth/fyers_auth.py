@@ -16,7 +16,10 @@ import pyotp
 import requests
 
 # Load environment variables
-load_dotenv()
+for _p in [Path("backend/.env"), Path(".env"), Path(__file__).resolve().parent.parent.parent / ".env"]:
+    if _p.exists():
+        load_dotenv(_p)
+        break
 
 logger = logging.getLogger(__name__)
 
@@ -39,11 +42,6 @@ class FyersAuthConfig(BaseModel):
     @classmethod
     def from_env(cls) -> "FyersAuthConfig":
         """Instantiate configuration strictly from environment variables."""
-        for p in [Path("backend/.env"), Path(".env"), Path(__file__).resolve().parent.parent.parent / ".env"]:
-            if p.exists():
-                load_dotenv(p)
-                break
-
         client_id = os.getenv("FYERS_CLIENT_ID")
         secret_key = os.getenv("FYERS_SECRET_KEY")
         pin = os.getenv("FYERS_PIN")

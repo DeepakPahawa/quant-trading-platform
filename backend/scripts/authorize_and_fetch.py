@@ -135,8 +135,8 @@ def main():
             client = auth_manager.get_client()
             prof = client.get_profile()
             if isinstance(prof, dict) and (prof.get("s") == "ok" or prof.get("code") == 200):
-                print("Token is ACTIVE and VALID! Fetching live SBIN data directly...")
-                fetch_and_display_sbin_live(client)
+                print("Token is ACTIVE and VALID! Fetching live data directly...")
+                fetch_and_display_stocks_live(client)
                 return
         except Exception:
             print("Existing token is expired or invalid. Re-authorizing...")
@@ -203,9 +203,9 @@ def main():
         print(f"Error exchanging authorization code: {e}")
         return
 
-    # Step 4: Fetch live SBIN data
+    # Step 4: Fetch live data
     client = auth_manager.get_client()
-    fetch_and_display_sbin_live(client)
+    fetch_and_display_stocks_live(client)
 
 
 if __name__ == "__main__":

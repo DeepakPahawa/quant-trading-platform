@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 
 from backend.app.auth.fyers_auth import get_valid_fyers_client
 from backend.app.routers.market import router as market_router
+from backend.app.routers.options import router as options_router
 from backend.app.routers.stream import router as stream_router
 
 logging.basicConfig(
@@ -39,6 +40,7 @@ app.add_middleware(
 )
 
 app.include_router(market_router)
+app.include_router(options_router)
 app.include_router(stream_router)
 
 

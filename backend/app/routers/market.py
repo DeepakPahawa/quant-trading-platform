@@ -1,8 +1,11 @@
 """Market data REST endpoints for historical bars and symbol discovery."""
 
 import logging
+import os
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
+from dotenv import load_dotenv
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
 
@@ -135,7 +138,10 @@ class LoginUrlResponse(BaseModel):
 
 
 class AuthExchangeRequest(BaseModel):
-    auth_code_or_url: str = Field(..., description="Authorization code or redirected URL from FYERS login")
+    auth_code_or_url: Optional[str] = Field(
+        default=None,
+        description="Authorization code or redirected URL from FYERS login. If omitted, read from FYERS_AUTH_CODE in .env"
+    )
 
 
 class AuthExchangeResponse(BaseModel):
@@ -154,11 +160,41 @@ def get_login_url() -> LoginUrlResponse:
 
 
 @router.post("/auth/exchange", response_model=AuthExchangeResponse)
-def exchange_token(request: AuthExchangeRequest) -> AuthExchangeResponse:
-    """Exchange browser redirect auth_code or URL for an access token."""
+def exchange_token(request: Optional[AuthExchangeRequest] = None) -> AuthExchangeResponse:
+    """Exchange browser redirect auth_code or URL for an access token.
+    
+    If no code is provided in the body, it falls back to FYERS_AUTH_CODE from .env.
+    """
+    # 1. Determine auth_code_or_url
+    code_input: Optional[str] = None
+    if request and request.auth_code_or_url and request.auth_code_or_url.strip():
+        code_input = request.auth_code_or_url.strip()
+    else:
+        # Reload .env to ensure freshly edited tokens are picked up
+        for env_path in [Path("backend/.env"), Path(".env"), Path(__file__).resolve().parent.parent.parent / ".env"]:
+            if env_path.exists():
+                load_dotenv(env_path, override=True)
+                break
+        code_input = (
+            os.getenv("FYERS_AUTH_CODE")
+            or os.getenv("AUTH_CODE")
+            or os.getenv("FYERS_AUTHCODE")
+            or os.getenv("AUTHCODE")
+        )
+        if code_input:
+            code_input = code_input.strip()
+
+    if not code_input:
+        return AuthExchangeResponse(
+            status="error",
+            authenticated=False,
+            profile=None,
+            message="No auth_code provided in request body and FYERS_AUTH_CODE not found in .env",
+        )
+
     auth_manager = FyersAuthManager()
     try:
-        auth_manager.exchange_auth_code(request.auth_code_or_url)
+        auth_manager.exchange_auth_code(code_input)
         client = auth_manager.get_client()
         profile_res = client.get_profile()
         profile_data = profile_res.get("data") if isinstance(profile_res, dict) else profile_res
@@ -226,6 +262,28 @@ def get_tft_feature_sequence(
         }
     except Exception as e:
         logger.error("Failed preparing TFT tensor for %s: %s", symbol, e)
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(e))
+
+
+@router.get("/market/quotes")
+def get_multiple_quotes(
+    symbols: str = Query(
+        default="NSE:SBIN-EQ,NSE:RELIANCE-EQ",
+        description="Comma-separated list of symbols (e.g. 'NSE:SBIN-EQ,NSE:ICICIBANK-EQ,NSE:TCS-EQ')"
+    ),
+) -> Dict[str, Any]:
+    """Fetch real-time Level-2 quotes and microstructure metrics for a list of stocks."""
+    try:
+        client = get_valid_fyers_client()
+        sym_list = [s.strip() for s in symbols.split(",") if s.strip()]
+        if not sym_list:
+            raise HTTPException(status_code=400, detail="No symbols provided")
+        quotes = fetch_fyers_quotes(client, sym_list)
+        return {"status": "ok", "count": len(quotes), "data": quotes}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Failed fetching multiple quotes: %s", e)
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(e))
 
 
