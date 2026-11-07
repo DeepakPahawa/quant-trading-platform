@@ -1,9 +1,10 @@
 """Historical OHLCV and OI data fetcher with chunked pagination for FYERS API v3."""
 
 from datetime import date, datetime, timedelta, timezone
+from collections import deque
 import logging
 import time
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Deque, Dict, List, Optional, Tuple, Union
 
 from fyers_apiv3 import fyersModel
 import polars as pl
@@ -151,18 +152,57 @@ def is_rate_limited(message: Any) -> bool:
     return "limit" in text or "429" in text
 
 
+class RequestRateLimiter:
+    """Sliding-window limiter: at most `max_calls` requests in any `window_sec` seconds.
+
+    FYERS Standard plan allows 50 history requests per minute. Keep a margin below that.
+    `clock` and `sleep` are injectable so tests don't wait in real time.
+    """
+
+    def __init__(
+        self,
+        max_calls: int = 45,
+        window_sec: float = 60.0,
+        clock: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
+        if max_calls < 1:
+            raise ValueError("max_calls must be at least 1")
+        self.max_calls = max_calls
+        self.window_sec = window_sec
+        self._clock = clock
+        self._sleep = sleep
+        self._stamps: Deque[float] = deque()
+
+    def acquire(self) -> None:
+        """Block until one more request is allowed, then record it."""
+        now = self._clock()
+        while self._stamps and now - self._stamps[0] >= self.window_sec:
+            self._stamps.popleft()
+        if len(self._stamps) >= self.max_calls:
+            wait = self.window_sec - (now - self._stamps[0]) + 0.05
+            self._sleep(wait)
+            now = self._clock()
+            while self._stamps and now - self._stamps[0] >= self.window_sec:
+                self._stamps.popleft()
+        self._stamps.append(now)
+
+
 class HistoricalBarFetcher:
     """Fetches historical OHLCV + OI data from FYERS API v3 with automatic pagination."""
 
     MAX_CHUNK_DAYS = 100
-    # FYERS Standard plan allows 5 requests/second. Pause between chunks and back off on 429s.
+    MAX_DAILY_CHUNK_DAYS = 365
+    # Short backoff for per-second limits. Per-minute limits wait out the whole window.
     RATE_LIMIT_RETRIES = 3
     RATE_LIMIT_BACKOFF_SEC = 1.0
+    MINUTE_WINDOW_WAIT_SEC = 65.0
 
     def __init__(self, fyers_client: Optional[fyersModel.FyersModel] = None) -> None:
         self._client = fyers_client
         # Chunks that FYERS rejected in the most recent fetch_bars call.
         self.failed_chunks: List[Dict[str, str]] = []
+        self.rate_limiter = RequestRateLimiter()
 
     @property
     def client(self) -> fyersModel.FyersModel:
@@ -196,6 +236,7 @@ class HistoricalBarFetcher:
 
         response: Any = None
         for attempt in range(self.RATE_LIMIT_RETRIES + 1):
+            self.rate_limiter.acquire()
             response = self.client.history(data=data)
             if (
                 isinstance(response, dict)
@@ -203,7 +244,11 @@ class HistoricalBarFetcher:
                 and is_rate_limited(response.get("message"))
                 and attempt < self.RATE_LIMIT_RETRIES
             ):
-                wait = self.RATE_LIMIT_BACKOFF_SEC * (2 ** attempt)
+                message = str(response.get("message") or "").lower()
+                if "minute" in message:
+                    wait = self.MINUTE_WINDOW_WAIT_SEC
+                else:
+                    wait = self.RATE_LIMIT_BACKOFF_SEC * (2 ** attempt)
                 logger.warning("FYERS rate limit hit for %s; retrying in %.1fs", symbol, wait)
                 time.sleep(wait)
                 continue
@@ -285,7 +330,9 @@ class HistoricalBarFetcher:
             logger.warning("start_date %s is after end_date %s. Returning empty DataFrame.", start_d, end_d)
             return pl.DataFrame(schema=HISTORICAL_BAR_SCHEMA)
 
-        chunks = split_date_range(start_d, end_d, max_days=self.MAX_CHUNK_DAYS)
+        # Daily bars accept a full year per request (verified on the Standard plan). Intraday is 100 days.
+        max_days = self.MAX_DAILY_CHUNK_DAYS if norm_res == "D" else self.MAX_CHUNK_DAYS
+        chunks = split_date_range(start_d, end_d, max_days=max_days)
         logger.info(
             "Fetching %s bars for %s from %s to %s across %d chunk(s)",
             norm_res, symbol, start_d, end_d, len(chunks)

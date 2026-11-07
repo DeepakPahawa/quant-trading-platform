@@ -29,8 +29,9 @@ def nse_to_fyers(symbol: str) -> str:
 
 def load_universe(name: str, base_dir: Path = UNIVERSE_DIR) -> List[str]:
     """Load a universe by name ('nifty50' or 'nifty500') as sorted FYERS symbols."""
-    if name not in KNOWN_UNIVERSES:
-        raise ValueError(f"Unknown universe {name!r}. Expected one of {KNOWN_UNIVERSES}.")
+    # Any `<name>.csv` in base_dir is a valid universe, so larger or custom sets can be tested later.
+    if not name or not name.replace("_", "").replace("-", "").isalnum():
+        raise ValueError(f"Invalid universe name {name!r}. Use letters, digits, '_' or '-' (e.g. {KNOWN_UNIVERSES}).")
     path = base_dir / f"{name}.csv"
     if not path.exists():
         raise FileNotFoundError(
